@@ -378,14 +378,28 @@
     </div>
 
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, query, where, getDocs, Timestamp, doc, updateDoc, deleteDoc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // Firebase SDK imports - Updated to 11.8.1
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, where, getDocs, Timestamp, doc, updateDoc, deleteDoc, setDoc } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-firestore.js";
+        import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-analytics.js"; // Added Analytics
 
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "YOUR_AUTH_DOMAIN", projectId: "YOUR_PROJECT_ID" };
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'impel-down-default';
+        // Your web app's Firebase configuration - Updated with provided values
+        const firebaseConfig = {
+          apiKey: "AIzaSyAHTf1p7tsHHC_FywDu04JORxnRLuvTaiQ",
+          authDomain: "impeldown-f29a5.firebaseapp.com",
+          projectId: "impeldown-f29a5",
+          storageBucket: "impeldown-f29a5.appspot.com", // Corrected to .appspot.com as it's the more common and likely correct format
+          messagingSenderId: "419055960527",
+          appId: "1:419055960527:web:0ceeace20d5c50619d12ba",
+          measurementId: "G-1SHEZVQZXT"
+        };
+        
+        const appId = firebaseConfig.appId; 
 
+        // Initialize Firebase
         const app = initializeApp(firebaseConfig);
+        const analytics = getAnalytics(app); 
         const auth = getAuth(app);
         const db = getFirestore(app);
         // setLogLevel('debug'); 
@@ -449,24 +463,55 @@
         onAuthStateChanged(auth, async (user) => {
             if (user) {
                 userId = user.uid;
+                console.log("User authenticated. UID:", userId);
             } else {
+                // This case should ideally not be hit if anonymous sign-in is successful.
+                // If it is, it means all sign-in attempts failed.
                 const randomId = crypto.randomUUID();
-                userId = `anonymous-${randomId}`; 
+                userId = `unauthenticated-${randomId}`; 
+                console.warn("User is not authenticated. Using temporary ID:", userId);
+                // Potentially show a message to the user that some features might be limited.
             }
+            // Ensure collection refs are set up after userId is determined.
             prisonersCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/prisoners`);
             publicRosterCollectionRef = collection(db, `artifacts/${appId}/public/data/impel_down_roster`); 
         });
         
         async function attemptSignIn() {
             try {
+                // __initial_auth_token is a Canvas-specific variable.
+                // For external hosting (like GitHub Pages), it will be undefined.
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    console.log("Attempting sign in with custom token (Canvas environment).");
                     await signInWithCustomToken(auth, __initial_auth_token);
+                    console.log("Successfully signed in with custom token.");
                 } else {
+                    console.log("No custom token found (expected for external hosting), attempting anonymous sign in.");
                     await signInAnonymously(auth);
+                    console.log("Successfully signed in anonymously.");
                 }
             } catch (error) {
-                console.error("Authentication error:", error);
-                showDialog(`인증 오류: ${error.message}. 일부 기능이 제한될 수 있습니다.`);
+                console.warn("Initial authentication attempt failed:", error.code, error.message);
+                // This catch block is for the primary attempt (custom token if defined, else anonymous)
+                // If __initial_auth_token was defined and failed (e.g., mismatch), we MUST fall back to anonymous.
+                if ((typeof __initial_auth_token !== 'undefined' && __initial_auth_token) &&
+                    (error.code === 'auth/custom-token-mismatch' || error.code === 'auth/invalid-custom-token')) {
+                    
+                    console.log("Custom token failed for external config, explicitly falling back to anonymous sign-in.");
+                    try {
+                        await signInAnonymously(auth);
+                        console.log("Successfully signed in anonymously after custom token failure.");
+                    } catch (anonError) {
+                        console.error("Fallback anonymous sign-in also failed:", anonError.code, anonError.message);
+                        showDialog(`인증 오류: ${anonError.message}. 앱 사용이 제한될 수 있습니다.`);
+                    }
+                } else {
+                    // This case means either:
+                    // 1. Anonymous sign-in (as primary) failed.
+                    // 2. Custom token sign-in failed for a reason other than mismatch/invalid (less likely for this error).
+                    console.error("Unhandled authentication error or primary anonymous sign-in failure:", error.code, error.message);
+                    showDialog(`인증 오류: ${error.message}. 앱 사용이 제한될 수 있습니다.`);
+                }
             }
         }
         attemptSignIn();
