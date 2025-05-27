@@ -272,6 +272,7 @@
                 <button id="dbInfoBtn" class="btn btn-secondary text-xs"><i class="fas fa-database mr-1"></i>DB 정보</button>
             </div>
             <input type="hidden" id="editingDocId" value="">
+            <input type="hidden" id="editingOriginalCreatorId" value="">
         </header>
 
         <div class="flex flex-col md:flex-row md:space-x-6 mb-8">
@@ -428,6 +429,7 @@
         const submitBtn = el('submitBtn');
         const cancelEditBtn = el('cancelEditBtn');
         const editingDocIdInput = el('editingDocId');
+        const editingOriginalCreatorIdInput = el('editingOriginalCreatorId'); // Hidden input to store original creator ID
         const actionsBar = el('actionsBar');
         const dbInfoBtn = el('dbInfoBtn');
         const viewRosterBtn = el('viewRosterBtn');
@@ -553,6 +555,9 @@
                 if (isDelete) {
                     await deleteDoc(publicDocRef);
                 } else {
+                    // When syncing, ensure originalCreatorId is correctly set.
+                    // If prisonerData contains originalCreatorId (from an edit of existing public record), use it.
+                    // Otherwise (new record), prisonerData.userId (current user) becomes originalCreatorId.
                     const publicData = {
                         personInfo: prisonerData.personInfo,
                         championInfo: prisonerData.championInfo,
@@ -561,7 +566,7 @@
                         imprisonmentDate: prisonerData.imprisonmentDate, 
                         durationDays: prisonerData.durationDays,
                         prisonLevel: prisonerData.prisonLevel,
-                        originalCreatorId: prisonerData.userId 
+                        originalCreatorId: prisonerData.originalCreatorId || prisonerData.userId 
                     };
                     await setDoc(publicDocRef, publicData); 
                 }
@@ -582,6 +587,7 @@
             const opggScore = parseFloat(addPrisonerForm.opggScore.value);
             const kda = addPrisonerForm.kda.value.trim();
             const editingDocId = editingDocIdInput.value;
+            const originalCreatorIdForEdit = editingOriginalCreatorIdInput.value; // Get stored original creator ID
 
             if (editingDocId) { 
                 const terms = getPrisonTerms(opggScore); 
@@ -590,32 +596,54 @@
                     return;
                 }
                 
-                const docRef = doc(prisonersCollectionRef, editingDocId);
-                const existingDocSnap = await getDoc(docRef);
-                const existingData = existingDocSnap.data();
-
-                let newImprisonmentDate = existingData.imprisonmentDate; // Default to existing
-                if (imprisonmentDateEditInput.value) {
-                    // Ensure the date string is treated as local date, not UTC, to avoid timezone shifts
+                let newImprisonmentDate;
+                if (!imprisonmentDateDiv.classList.contains('hidden') && imprisonmentDateEditInput.value) {
                     const dateParts = imprisonmentDateEditInput.value.split('-');
-                    const year = parseInt(dateParts[0]);
-                    const month = parseInt(dateParts[1]) - 1; // Month is 0-indexed
-                    const day = parseInt(dateParts[2]);
-                    newImprisonmentDate = Timestamp.fromDate(new Date(year, month, day));
+                    if (dateParts.length === 3) {
+                        const year = parseInt(dateParts[0]);
+                        const month = parseInt(dateParts[1]) - 1; 
+                        const day = parseInt(dateParts[2]);
+                        const localDate = new Date(year, month, day);
+                        newImprisonmentDate = Timestamp.fromDate(localDate);
+                    } else {
+                        // If date input is invalid, try to fetch existing date to avoid losing it
+                        const publicDocRef = doc(publicRosterCollectionRef, editingDocId);
+                        const existingPublicDocSnap = await getDoc(publicDocRef);
+                        newImprisonmentDate = existingPublicDocSnap.data()?.imprisonmentDate || Timestamp.fromDate(new Date()); // Fallback
+                        console.warn("Invalid date in edit, using existing or current.", imprisonmentDateEditInput.value);
+                    }
+                } else {
+                    // If field is hidden (should not happen if logic is correct) or empty, fetch existing
+                    const publicDocRef = doc(publicRosterCollectionRef, editingDocId);
+                    const existingPublicDocSnap = await getDoc(publicDocRef);
+                    newImprisonmentDate = existingPublicDocSnap.data()?.imprisonmentDate || Timestamp.fromDate(new Date()); // Fallback
                 }
 
-
-                const updatedData = { 
+                // Data for the public roster
+                const publicUpdatePayload = { 
                     personInfo, championInfo, opggScore, kda,
                     prisonLevel: terms.prisonLevel,
                     durationDays: terms.durationDays,
                     imprisonmentDate: newImprisonmentDate, 
-                    userId: existingData.userId 
+                    originalCreatorId: originalCreatorIdForEdit || userId // Preserve original creator or fallback
                 };
 
+                // Data for the current user's private collection (if they want to keep a "copy" or their own version)
+                const privateUpdatePayload = {
+                    ...publicUpdatePayload, // Start with public data
+                    userId: userId // Ensure this private record is owned by the current user
+                };
+
+
                 try {
-                    await updateDoc(docRef, updatedData);
-                    await syncToPublicRoster(editingDocId, updatedData); 
+                    // Update public record
+                    await updateDoc(doc(publicRosterCollectionRef, editingDocId), publicUpdatePayload);
+                    
+                    // Update or create the record in the current user's private collection
+                    // This ensures that if the user edits a record (even someone else's),
+                    // their private view of it reflects their edit.
+                    await setDoc(doc(prisonersCollectionRef, editingDocId), privateUpdatePayload, { merge: true });
+
                     showDialog(`${personInfo} (${championInfo}) 정보가 성공적으로 수정되었습니다.`);
                     resetFormToRegisterMode();
                     clearSearchResults(); 
@@ -624,11 +652,13 @@
                     showDialog(`정보 수정 중 오류 발생: ${error.message}`);
                 }
             } else { 
+                // New registration logic
                 const q = query(prisonersCollectionRef, where("personInfo", "==", personInfo), where("championInfo", "==", championInfo));
-                const querySnapshot = await getDocs(q);
+                const querySnapshot = await getDocs(q); // Check current user's private list first
 
-                if (!querySnapshot.empty) { 
+                if (!querySnapshot.empty) { // Re-offender in user's private list
                     const existingDoc = querySnapshot.docs[0];
+                    // ... (re-offender logic as before, updates private and syncs to public) ...
                     const currentLevel = existingDoc.data().prisonLevel;
                     const newLevel = getNextLowerLevel(currentLevel);
                     const newTerms = getTermsForLevel(newLevel);
@@ -642,15 +672,16 @@
                     };
                     try {
                         await updateDoc(doc(prisonersCollectionRef, existingDoc.id), reoffenderData);
-                        await syncToPublicRoster(existingDoc.id, reoffenderData);
+                        // Sync re-offender data to public, originalCreatorId will be current userId
+                        await syncToPublicRoster(existingDoc.id, reoffenderData); 
                         showDialog(`${personInfo} (${championInfo}) 재수감 처리 완료. 지하 ${newTerms.prisonLevel}층으로 강등 및 형기 재시작.`);
                         addPrisonerForm.reset();
-                    } catch (error)
-                     {
+                    } catch (error) {
                         console.error("Error updating re-offender: ", error);
                         showDialog(`재수감 처리 중 오류: ${error.message}`);
                     }
-                } else { 
+
+                } else { // Potentially new prisoner overall, or new to this user
                     const terms = getPrisonTerms(opggScore);
                     if (!terms) {
                         showDialog("OP.GG SCORE가 유효한 범위 (0.0 ~ 2.79)에 있지 않습니다.");
@@ -661,10 +692,12 @@
                         imprisonmentDate: Timestamp.fromDate(new Date()),
                         durationDays: terms.durationDays,
                         prisonLevel: terms.prisonLevel,
-                        userId 
+                        userId // Current user is the creator
                     };
                     try {
+                        // Add to user's private collection
                         const newDocRef = await addDoc(prisonersCollectionRef, newPrisonerData);
+                        // Sync to public roster, using newDocRef.id and newPrisonerData (which includes current userId as originalCreatorId)
                         await syncToPublicRoster(newDocRef.id, newPrisonerData); 
                         showDialog(`수감자 ${personInfo} (${championInfo}) 정보가 성공적으로 등록되었습니다.`);
                         addPrisonerForm.reset();
@@ -678,16 +711,16 @@
 
         function formatDate(dateObj) {
             if (!dateObj) return 'N/A';
-            if (dateObj.toDate) dateObj = dateObj.toDate(); // Convert Firestore Timestamp to JS Date
+            if (dateObj.toDate) dateObj = dateObj.toDate(); 
             const year = dateObj.getFullYear();
             const month = String(dateObj.getMonth() + 1).padStart(2, '0');
             const day = String(dateObj.getDate()).padStart(2, '0');
             return `${year}년 ${month}월 ${day}일`;
         }
         
-        // Function to format JS Date to YYYY-MM-DD for date input
         function formatDateForInput(dateObj) {
             if (!dateObj) return '';
+            if (dateObj.toDate) dateObj = dateObj.toDate(); 
             const year = dateObj.getFullYear();
             const month = String(dateObj.getMonth() + 1).padStart(2, '0');
             const day = String(dateObj.getDate()).padStart(2, '0');
@@ -733,8 +766,8 @@
         
         searchPrisonerForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            if (!userId || !prisonersCollectionRef) {
-                showDialog("사용자 인증이 진행중이거나 실패했습니다.");
+            if (!userId || !publicRosterCollectionRef) { 
+                showDialog("데이터베이스 연결을 확인 중입니다. 잠시 후 다시 시도해주세요.");
                 return;
             }
 
@@ -760,7 +793,7 @@
             }
 
             try {
-                const q = query(prisonersCollectionRef, ...queryConstraints);
+                const q = query(publicRosterCollectionRef, ...queryConstraints);
                 const querySnapshot = await getDocs(q);
 
                 if (querySnapshot.empty) {
@@ -772,6 +805,7 @@
                     const prisonerDoc = querySnapshot.docs[0];
                     const prisoner = prisonerDoc.data();
                     prisoner.id = prisonerDoc.id; 
+                    // prisoner.isOwner = (prisoner.originalCreatorId === userId); // No longer needed for button rendering
 
                     const imprisonmentDate = prisoner.imprisonmentDate?.toDate();
                     if (!imprisonmentDate) { 
@@ -805,10 +839,11 @@
                         <p><strong>수감 시작일:</strong> ${formatDate(imprisonmentDate)}</p>
                         <p><strong>수감 기간:</strong> ${prisoner.durationDays}일</p>
                         <p><strong>배정 층수:</strong> 지하 ${prisoner.prisonLevel}층</p>
+                        <p class="text-xs text-gray-500 mt-1">등록자: ${prisoner.originalCreatorId === userId ? '본인' : prisoner.originalCreatorId || '알 수 없음'}</p>
                     `;
-                    renderActionButtons(prisoner);
-                } else { // Multiple results
-                    statusMessage.textContent = `${querySnapshot.docs.length}명의 수감자 정보가 검색되었습니다. (개인 데이터 기준)`;
+                    renderActionButtons(prisoner); 
+                } else { 
+                    statusMessage.textContent = `${querySnapshot.docs.length}명의 수감자 정보가 검색되었습니다.`;
                     let resultsHTML = '<div class="space-y-2">';
                     const today = new Date();
                     const todayDateOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
@@ -835,7 +870,7 @@
                     });
                     resultsHTML += '</div>';
                     prisonerDetailsContent.innerHTML = resultsHTML;
-                    actionsBar.innerHTML = ''; // No actions for multiple results view
+                    actionsBar.innerHTML = ''; 
                     levelArrow.style.display = 'none'; 
                     championImageEl.classList.add('hidden');
                 }
@@ -846,13 +881,14 @@
             }
         });
 
-        function renderActionButtons(prisoner) {
+        function renderActionButtons(prisoner) { // Removed isOwner parameter
             actionsBar.innerHTML = ''; 
             
+            // Always show buttons
             const editButton = document.createElement('button');
             editButton.innerHTML = '<i class="fas fa-edit mr-1"></i>수정';
             editButton.classList.add('btn', 'btn-secondary', 'text-xs', 'flex-1');
-            editButton.onclick = () => setupEditMode(prisoner);
+            editButton.onclick = () => setupEditMode(prisoner); 
             actionsBar.appendChild(editButton);
 
             const deleteButton = document.createElement('button');
@@ -862,7 +898,7 @@
             actionsBar.appendChild(deleteButton);
         }
 
-        function setupEditMode(prisoner) {
+        function setupEditMode(prisoner) { 
             formTitle.innerHTML = '<i class="fas fa-user-edit"></i>수감자 정보 수정';
             submitBtn.innerHTML = '<i class="fas fa-check-circle mr-2"></i>정보 수정';
             cancelEditBtn.classList.remove('hidden');
@@ -871,11 +907,11 @@
             addPrisonerForm.championInfo.value = prisoner.championInfo;
             addPrisonerForm.opggScore.value = prisoner.opggScore;
             addPrisonerForm.kda.value = prisoner.kda || '';
-            editingDocIdInput.value = prisoner.id;
+            editingDocIdInput.value = prisoner.id; 
+            editingOriginalCreatorIdInput.value = prisoner.originalCreatorId || userId; // Store original creator for public sync
 
-            // Populate and show imprisonment date input
-            const currentImprisonmentDate = prisoner.imprisonmentDate?.toDate();
-            imprisonmentDateEditInput.value = formatDateForInput(currentImprisonmentDate);
+            const currentImprisonmentDate = prisoner.imprisonmentDate; 
+            imprisonmentDateEditInput.value = formatDateForInput(currentImprisonmentDate); 
             imprisonmentDateDiv.classList.remove('hidden');
 
 
@@ -890,18 +926,28 @@
             cancelEditBtn.classList.add('hidden');
             addPrisonerForm.reset();
             editingDocIdInput.value = "";
-            imprisonmentDateDiv.classList.add('hidden'); // Hide imprisonment date input
+            editingOriginalCreatorIdInput.value = "";
+            imprisonmentDateDiv.classList.add('hidden'); 
             imprisonmentDateEditInput.value = '';
         }
 
-        async function confirmDeletePrisoner(prisoner) {
+        async function confirmDeletePrisoner(prisoner) { 
             showDialog(
                 `정말로 ${prisoner.personInfo} (${prisoner.championInfo}) 수감자 정보를 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.`,
                 async () => {
                     try {
-                        if (!prisonersCollectionRef) throw new Error("DB 연결이 초기화되지 않았습니다.");
-                        await deleteDoc(doc(prisonersCollectionRef, prisoner.id));
-                        await syncToPublicRoster(prisoner.id, null, true); 
+                        if (!prisonersCollectionRef || !publicRosterCollectionRef) throw new Error("DB 연결이 초기화되지 않았습니다.");
+                        
+                        // Delete from public roster
+                        await deleteDoc(doc(publicRosterCollectionRef, prisoner.id));
+                        
+                        // Attempt to delete from current user's private collection
+                        try {
+                            await deleteDoc(doc(prisonersCollectionRef, prisoner.id));
+                        } catch (privateDeleteError) {
+                            console.warn("Could not delete private record (it might not exist for this user or different owner):", privateDeleteError);
+                        }
+
                         showDialog("수감자 정보가 성공적으로 삭제되었습니다.");
                         clearSearchResults();
                     } catch (error) {
